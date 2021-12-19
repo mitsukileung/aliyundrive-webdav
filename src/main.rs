@@ -1,14 +1,16 @@
 use std::convert::Infallible;
 use std::net::ToSocketAddrs;
-use std::{env, io};
+use std::{env, io, path::PathBuf};
 
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 use structopt::StructOpt;
 use tracing::{debug, error, info};
 use webdav_handler::{body::Body, memls::MemLs, DavConfig, DavHandler};
 
+use drive::{AliyunDrive, DriveConfig};
 use vfs::AliyunDriveFileSystem;
 
+mod cache;
 mod drive;
 mod vfs;
 
@@ -16,10 +18,10 @@ mod vfs;
 #[structopt(name = "aliyundrive-webdav")]
 struct Opt {
     /// Listen host
-    #[structopt(long, default_value = "0.0.0.0")]
+    #[structopt(long, env = "HOST", default_value = "0.0.0.0")]
     host: String,
     /// Listen port
-    #[structopt(short, long, default_value = "8080")]
+    #[structopt(short, env = "PORT", long, default_value = "8080")]
     port: u16,
     /// Aliyun drive refresh token
     #[structopt(short, long, env = "REFRESH_TOKEN")]
@@ -39,9 +41,21 @@ struct Opt {
     /// Directory entries cache size
     #[structopt(long, default_value = "1000")]
     cache_size: usize,
+    /// Directory entries cache expiration time in seconds
+    #[structopt(long, default_value = "600")]
+    cache_ttl: u64,
     /// Root directory path
     #[structopt(long, default_value = "/")]
     root: String,
+    /// Working directory, refresh_token will be stored in there if specified
+    #[structopt(short = "w", long)]
+    workdir: Option<PathBuf>,
+    /// Delete file permanently instead of trashing it
+    #[structopt(long, conflicts_with = "domain-id")]
+    no_trash: bool,
+    /// Aliyun PDS domain id
+    #[structopt(long)]
+    domain_id: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -61,7 +75,36 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("auth-user and auth-password should be specified together.");
     }
 
-    let fs = AliyunDriveFileSystem::new(opt.refresh_token, opt.root, opt.cache_size)
+    let (drive_config, no_trash) = if let Some(domain_id) = opt.domain_id {
+        (
+            DriveConfig {
+                api_base_url: format!("https://{}.api.aliyunpds.com", domain_id),
+                refresh_token_url: format!(
+                    "https://{}.auth.aliyunpds.com/v2/account/token",
+                    domain_id
+                ),
+                workdir: opt.workdir,
+                app_id: Some("BasicUI".to_string()),
+            },
+            true, // PDS doesn't have trash support
+        )
+    } else {
+        (
+            DriveConfig {
+                api_base_url: "https://api.aliyundrive.com".to_string(),
+                refresh_token_url: "https://websv.aliyundrive.com/token/refresh".to_string(),
+                workdir: opt.workdir,
+                app_id: None,
+            },
+            opt.no_trash,
+        )
+    };
+    let drive = AliyunDrive::new(drive_config, opt.refresh_token)
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "initialize aliyundrive client failed")
+        })?;
+    let fs = AliyunDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl, no_trash)
         .await
         .map_err(|_| {
             io::Error::new(
@@ -119,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
                                         "WWW-Authenticate",
                                         "Basic realm=\"aliyundrive-webdav\"",
                                     )
-                                    .body(Body::from("Authenticate required".to_string()))
+                                    .body(Body::from("Authentication required".to_string()))
                                     .unwrap();
                                 return Ok(response);
                             }

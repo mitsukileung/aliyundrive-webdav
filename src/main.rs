@@ -1,11 +1,27 @@
-use std::convert::Infallible;
+use std::future::Future;
 use std::net::ToSocketAddrs;
-use std::{env, io, path::PathBuf};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::{env, io};
 
+use clap::Parser;
+use dav_server::{body::Body, memls::MemLs, DavConfig, DavHandler};
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
-use structopt::StructOpt;
+use hyper::{service::Service, Request, Response};
 use tracing::{debug, error, info};
-use webdav_handler::{body::Body, memls::MemLs, DavConfig, DavHandler};
+
+#[cfg(feature = "rustls-tls")]
+use {
+    futures_util::stream::StreamExt,
+    hyper::server::accept,
+    hyper::server::conn::AddrIncoming,
+    rustls::{Certificate, PrivateKey, ServerConfig},
+    std::fs::File,
+    std::future::ready,
+    std::path::Path,
+    tls_listener::TlsListener,
+};
 
 use drive::{AliyunDrive, DriveConfig};
 use vfs::AliyunDriveFileSystem;
@@ -14,48 +30,59 @@ mod cache;
 mod drive;
 mod vfs;
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "aliyundrive-webdav")]
+#[derive(Parser, Debug)]
+#[clap(name = "aliyundrive-webdav", about, version, author)]
 struct Opt {
     /// Listen host
-    #[structopt(long, env = "HOST", default_value = "0.0.0.0")]
+    #[clap(long, env = "HOST", default_value = "0.0.0.0")]
     host: String,
     /// Listen port
-    #[structopt(short, env = "PORT", long, default_value = "8080")]
+    #[clap(short, env = "PORT", long, default_value = "8080")]
     port: u16,
     /// Aliyun drive refresh token
-    #[structopt(short, long, env = "REFRESH_TOKEN")]
+    #[clap(short, long, env = "REFRESH_TOKEN")]
     refresh_token: String,
     /// WebDAV authentication username
-    #[structopt(short = "U", long, env = "WEBDAV_AUTH_USER")]
+    #[clap(short = 'U', long, env = "WEBDAV_AUTH_USER")]
     auth_user: Option<String>,
     /// WebDAV authentication password
-    #[structopt(short = "W", long, env = "WEBDAV_AUTH_PASSWORD")]
+    #[clap(short = 'W', long, env = "WEBDAV_AUTH_PASSWORD")]
     auth_password: Option<String>,
     /// Automatically generate index.html
-    #[structopt(short = "I", long)]
+    #[clap(short = 'I', long)]
     auto_index: bool,
     /// Read/download buffer size in bytes, defaults to 10MB
-    #[structopt(short = "S", long, default_value = "10485760")]
+    #[clap(short = 'S', long, default_value = "10485760")]
     read_buffer_size: usize,
     /// Directory entries cache size
-    #[structopt(long, default_value = "1000")]
-    cache_size: usize,
+    #[clap(long, default_value = "1000")]
+    cache_size: u64,
     /// Directory entries cache expiration time in seconds
-    #[structopt(long, default_value = "600")]
+    #[clap(long, default_value = "600")]
     cache_ttl: u64,
     /// Root directory path
-    #[structopt(long, default_value = "/")]
+    #[clap(long, default_value = "/")]
     root: String,
     /// Working directory, refresh_token will be stored in there if specified
-    #[structopt(short = "w", long)]
+    #[clap(short = 'w', long)]
     workdir: Option<PathBuf>,
     /// Delete file permanently instead of trashing it
-    #[structopt(long, conflicts_with = "domain-id")]
+    #[clap(long, conflicts_with = "domain-id")]
     no_trash: bool,
     /// Aliyun PDS domain id
-    #[structopt(long)]
+    #[clap(long)]
     domain_id: Option<String>,
+    /// Enable read only mode
+    #[clap(long)]
+    read_only: bool,
+    /// TLS certificate file path
+    #[cfg(feature = "rustls-tls")]
+    #[clap(long, env = "TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+    /// TLS private key file path
+    #[cfg(feature = "rustls-tls")]
+    #[clap(long, env = "TLS_KEY")]
+    tls_key: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -68,12 +95,21 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing_subscriber::fmt::init();
 
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let auth_user = opt.auth_user;
-    let auth_pwd = opt.auth_password;
-    if (auth_user.is_some() && auth_pwd.is_none()) || (auth_user.is_none() && auth_pwd.is_some()) {
-        anyhow::bail!("auth-user and auth-password should be specified together.");
+    let auth_password = opt.auth_password;
+    if (auth_user.is_some() && auth_password.is_none())
+        || (auth_user.is_none() && auth_password.is_some())
+    {
+        anyhow::bail!("auth-user and auth-password must be specified together.");
     }
+
+    #[cfg(feature = "rustls-tls")]
+    let use_tls = match (opt.tls_cert.as_ref(), opt.tls_key.as_ref()) {
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        _ => anyhow::bail!("tls-cert and tls-key must be specified together."),
+    };
 
     let (drive_config, no_trash) = if let Some(domain_id) = opt.domain_id {
         (
@@ -104,14 +140,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| {
             io::Error::new(io::ErrorKind::Other, "initialize aliyundrive client failed")
         })?;
-    let fs = AliyunDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl, no_trash)
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "initialize aliyundrive file system failed",
-            )
-        })?;
+    let fs = AliyunDriveFileSystem::new(
+        drive,
+        opt.root,
+        opt.cache_size,
+        opt.cache_ttl,
+        no_trash,
+        opt.read_only,
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "initialize aliyundrive file system failed",
+        )
+    })?;
     debug!("aliyundrive file system initialized");
 
     let dav_server = DavHandler::builder()
@@ -130,57 +173,158 @@ async fn main() -> anyhow::Result<()> {
         .to_socket_addrs()
         .unwrap()
         .next()
-        .unwrap();
-    info!("listening on {:?}", addr);
+        .ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))?;
 
-    let make_service = hyper::service::make_service_fn(move |_| {
-        let auth_user = auth_user.clone();
-        let auth_pwd = auth_pwd.clone();
-        let should_auth = auth_user.is_some() && auth_pwd.is_some();
-        let dav_server = dav_server.clone();
-        async move {
-            let func = move |req: hyper::Request<hyper::Body>| {
-                let dav_server = dav_server.clone();
-                let auth_user = auth_user.clone();
-                let auth_pwd = auth_pwd.clone();
-                async move {
-                    if should_auth {
-                        let auth_user = auth_user.unwrap();
-                        let auth_pwd = auth_pwd.unwrap();
-                        let user = match req.headers().typed_get::<Authorization<Basic>>() {
-                            Some(Authorization(basic))
-                                if basic.username() == auth_user
-                                    && basic.password() == auth_pwd =>
-                            {
-                                basic.username().to_string()
-                            }
-                            Some(_) | None => {
-                                // return a 401 reply.
-                                let response = hyper::Response::builder()
-                                    .status(401)
-                                    .header(
-                                        "WWW-Authenticate",
-                                        "Basic realm=\"aliyundrive-webdav\"",
-                                    )
-                                    .body(Body::from("Authentication required".to_string()))
-                                    .unwrap();
-                                return Ok(response);
-                            }
-                        };
-                        let config = DavConfig::new().principal(user);
-                        Ok::<_, Infallible>(dav_server.handle_with(config, req).await)
-                    } else {
-                        Ok::<_, Infallible>(dav_server.handle(req).await)
-                    }
-                }
-            };
-            Ok::<_, Infallible>(hyper::service::service_fn(func))
-        }
+    #[cfg(feature = "rustls-tls")]
+    if use_tls {
+        let tls_key = opt.tls_key.as_ref().unwrap();
+        let tls_cert = opt.tls_cert.as_ref().unwrap();
+        let incoming = TlsListener::new(
+            rustls_server_config(tls_key, tls_cert)?,
+            AddrIncoming::bind(&addr)?,
+        )
+        .filter(|conn| {
+            if let Err(err) = conn {
+                error!("TLS error: {:?}", err);
+                ready(false)
+            } else {
+                ready(true)
+            }
+        });
+        let server = hyper::Server::builder(accept::from_stream(incoming)).serve(MakeSvc {
+            auth_user: auth_user.clone(),
+            auth_password: auth_password.clone(),
+            handler: dav_server.clone(),
+        });
+        info!("listening on https://{}", addr);
+        let _ = server.await.map_err(|e| error!("server error: {}", e));
+        return Ok(());
+    }
+    let server = hyper::Server::bind(&addr).serve(MakeSvc {
+        auth_user,
+        auth_password,
+        handler: dav_server,
     });
-
-    let _ = hyper::Server::bind(&addr)
-        .serve(make_service)
-        .await
-        .map_err(|e| error!("server error: {}", e));
+    info!("listening on http://{}", server.local_addr());
+    let _ = server.await.map_err(|e| error!("server error: {}", e));
     Ok(())
+}
+
+#[derive(Clone)]
+struct AliyunDriveWebDav {
+    auth_user: Option<String>,
+    auth_password: Option<String>,
+    handler: DavHandler,
+}
+
+impl Service<Request<hyper::Body>> for AliyunDriveWebDav {
+    type Response = Response<Body>;
+    type Error = hyper::Error;
+    #[allow(clippy::type_complexity)]
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<hyper::Body>) -> Self::Future {
+        let should_auth = self.auth_user.is_some() && self.auth_password.is_some();
+        let dav_server = self.handler.clone();
+        let auth_user = self.auth_user.clone();
+        let auth_pwd = self.auth_password.clone();
+        Box::pin(async move {
+            if should_auth {
+                let auth_user = auth_user.unwrap();
+                let auth_pwd = auth_pwd.unwrap();
+                let user = match req.headers().typed_get::<Authorization<Basic>>() {
+                    Some(Authorization(basic))
+                        if basic.username() == auth_user && basic.password() == auth_pwd =>
+                    {
+                        basic.username().to_string()
+                    }
+                    Some(_) | None => {
+                        // return a 401 reply.
+                        let response = hyper::Response::builder()
+                            .status(401)
+                            .header("WWW-Authenticate", "Basic realm=\"aliyundrive-webdav\"")
+                            .body(Body::from("Authentication required".to_string()))
+                            .unwrap();
+                        return Ok(response);
+                    }
+                };
+                let config = DavConfig::new().principal(user);
+                Ok(dav_server.handle_with(config, req).await)
+            } else {
+                Ok(dav_server.handle(req).await)
+            }
+        })
+    }
+}
+
+struct MakeSvc {
+    auth_user: Option<String>,
+    auth_password: Option<String>,
+    handler: DavHandler,
+}
+
+impl<T> Service<T> for MakeSvc {
+    type Response = AliyunDriveWebDav;
+    type Error = hyper::Error;
+    #[allow(clippy::type_complexity)]
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: T) -> Self::Future {
+        let auth_user = self.auth_user.clone();
+        let auth_password = self.auth_password.clone();
+        let handler = self.handler.clone();
+        let fut = async move {
+            Ok(AliyunDriveWebDav {
+                auth_user,
+                auth_password,
+                handler,
+            })
+        };
+        Box::pin(fut)
+    }
+}
+
+#[cfg(feature = "rustls-tls")]
+fn rustls_server_config(key: &Path, cert: &Path) -> anyhow::Result<ServerConfig> {
+    let mut key_reader = io::BufReader::new(File::open(key)?);
+    let mut cert_reader = io::BufReader::new(File::open(cert)?);
+
+    let key = PrivateKey(private_keys(&mut key_reader)?.remove(0));
+    let certs = rustls_pemfile::certs(&mut cert_reader)?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+
+    let mut config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(config)
+}
+
+#[cfg(feature = "rustls-tls")]
+fn private_keys(rd: &mut dyn io::BufRead) -> Result<Vec<Vec<u8>>, io::Error> {
+    use rustls_pemfile::{read_one, Item};
+
+    let mut keys = Vec::<Vec<u8>>::new();
+    loop {
+        match read_one(rd)? {
+            None => return Ok(keys),
+            Some(Item::RSAKey(key)) => keys.push(key),
+            Some(Item::PKCS8Key(key)) => keys.push(key),
+            Some(Item::ECKey(key)) => keys.push(key),
+            _ => {}
+        };
+    }
 }

@@ -2,7 +2,6 @@ use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{env, io};
 
@@ -20,6 +19,7 @@ use {
     std::fs::File,
     std::future::ready,
     std::path::Path,
+    std::sync::Arc,
     tls_listener::TlsListener,
     tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig},
     tokio_rustls::TlsAcceptor,
@@ -90,6 +90,9 @@ struct Opt {
     #[cfg(feature = "rustls-tls")]
     #[clap(long, env = "TLS_KEY")]
     tls_key: Option<PathBuf>,
+    /// Enable debug log
+    #[clap(long)]
+    debug: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -97,12 +100,16 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "native-tls-vendored")]
     openssl_probe::init_ssl_cert_env_vars();
 
+    let opt = Opt::parse();
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "aliyundrive_webdav=info");
+        if opt.debug {
+            env::set_var("RUST_LOG", "aliyundrive_webdav=debug");
+        } else {
+            env::set_var("RUST_LOG", "aliyundrive_webdav=info");
+        }
     }
     tracing_subscriber::fmt::init();
 
-    let opt = Opt::parse();
     let auth_user = opt.auth_user;
     let auth_password = opt.auth_password;
     if (auth_user.is_some() && auth_password.is_none())

@@ -39,12 +39,12 @@ sudo snap install aliyundrive-webdav
 aarch64/arm/mipsel/x86_64/i686 等架构的版本，可以下载后使用 opkg 安装，以 nanopi r4s 为例：
 
 ```bash
-wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.6.2/aliyundrive-webdav_1.6.2-1_aarch64_generic.ipk
-wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.6.2/luci-app-aliyundrive-webdav_1.6.2_all.ipk
-wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.6.2/luci-i18n-aliyundrive-webdav-zh-cn_1.6.2-1_all.ipk
-opkg install aliyundrive-webdav_1.6.2-1_aarch64_generic.ipk
-opkg install luci-app-aliyundrive-webdav_1.6.2_all.ipk
-opkg install luci-i18n-aliyundrive-webdav-zh-cn_1.6.2-1_all.ipk
+wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.7.0/aliyundrive-webdav_1.7.0-1_aarch64_generic.ipk
+wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.7.0/luci-app-aliyundrive-webdav_1.7.0_all.ipk
+wget https://github.com/messense/aliyundrive-webdav/releases/download/v1.7.0/luci-i18n-aliyundrive-webdav-zh-cn_1.7.0-1_all.ipk
+opkg install aliyundrive-webdav_1.7.0-1_aarch64_generic.ipk
+opkg install luci-app-aliyundrive-webdav_1.7.0_all.ipk
+opkg install luci-i18n-aliyundrive-webdav-zh-cn_1.7.0-1_all.ipk
 ```
 
 其它 CPU 架构的路由器可在 [GitHub Releases](https://github.com/messense/aliyundrive-webdav/releases) 页面中查找对应的架构的主程序 ipk 文件下载安装， 常见
@@ -120,11 +120,12 @@ services:
 
 ```bash
 $ aliyundrive-webdav --help
-aliyundrive-webdav 1.6.2
+aliyundrive-webdav 1.7.0
 WebDAV server for AliyunDrive
 
 USAGE:
     aliyundrive-webdav [OPTIONS]
+    aliyundrive-webdav <SUBCOMMAND>
 
 OPTIONS:
         --cache-size <CACHE_SIZE>                Directory entries cache size [default: 1000]
@@ -148,6 +149,10 @@ OPTIONS:
     -V, --version                                Print version information
     -w, --workdir <WORKDIR>                      Working directory, refresh_token will be stored in there if specified
     -W, --auth-password <AUTH_PASSWORD>          WebDAV authentication password [env: WEBDAV_AUTH_PASSWORD=]
+
+SUBCOMMANDS:
+    help    Print this message or the help of the given subcommand(s)
+    qr      Scan QRCode
 ```
 
 > 注意：TLS/HTTPS 暂不支持 MIPS 架构。
@@ -161,6 +166,8 @@ OPTIONS:
 Application -> Local Storage 中的 `token` 字段中找到。  
 注意：不是复制整段 JSON 值，而是 JSON 里 `refresh_token` 字段的值，如下图所示红色部分：
 ![refresh token](./doc/refresh_token.png)
+
+* 命令行获取: `aliyundrive-webdav qr login`
 
 * 使用移动端 App refresh token: 需要在其前增加 `app:` 前缀,如 refresh token 为 `abcd` 则填入 `app:abcd`
 

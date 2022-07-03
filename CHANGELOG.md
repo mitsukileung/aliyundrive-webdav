@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.6.1
+
+* 降低自动更新失败日志级别为警告
+
+## 1.6.0
+
+* 增加自动更新功能
+
+## 1.5.1
+
+* 修复 Web 版 refresh token 刷新失败问题
+
+## 1.5.0
+
+* 增加移动端 App refresh token 支持,扫码登录使用 App refresh token.
+
+## 1.4.0
+
+* 命令行增加阿里云盘扫码登录功能
+
+## 1.3.3
+
+* 增加 `--strip-prefix` 参数
+
+## 1.3.2
+
+* 不使用阿里云盘文件列表接口返回的可能有问题的图片下载地址
+
 ## 1.3.1
 
 * 降低获取文件下载地址接口调用次数

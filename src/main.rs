@@ -9,7 +9,8 @@ use clap::Parser;
 use dav_server::{body::Body, memls::MemLs, DavConfig, DavHandler};
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 use hyper::{service::Service, Request, Response};
-use tracing::{debug, error, info};
+use self_update::cargo_crate_version;
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "rustls-tls")]
 use {
@@ -20,16 +21,17 @@ use {
     std::future::ready,
     std::path::Path,
     std::sync::Arc,
-    tls_listener::TlsListener,
+    tls_listener::{SpawningHandshakes, TlsListener},
     tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig},
     tokio_rustls::TlsAcceptor,
 };
 
-use drive::{AliyunDrive, DriveConfig};
+use drive::{parse_refresh_token, read_refresh_token, AliyunDrive, ClientType, DriveConfig};
 use vfs::AliyunDriveFileSystem;
 
 mod cache;
 mod drive;
+mod login;
 mod vfs;
 
 #[derive(Parser, Debug)]
@@ -42,12 +44,7 @@ struct Opt {
     #[clap(short, env = "PORT", long, default_value = "8080")]
     port: u16,
     /// Aliyun drive refresh token
-    #[clap(
-        short,
-        long,
-        env = "REFRESH_TOKEN",
-        required_unless_present = "workdir"
-    )]
+    #[clap(short, long, env = "REFRESH_TOKEN")]
     refresh_token: Option<String>,
     /// WebDAV authentication username
     #[clap(short = 'U', long, env = "WEBDAV_AUTH_USER")]
@@ -74,7 +71,7 @@ struct Opt {
     #[clap(short = 'w', long)]
     workdir: Option<PathBuf>,
     /// Delete file permanently instead of trashing it
-    #[clap(long, conflicts_with = "domain-id")]
+    #[clap(long, conflicts_with = "domain_id")]
     no_trash: bool,
     /// Aliyun PDS domain id
     #[clap(long)]
@@ -90,9 +87,15 @@ struct Opt {
     #[cfg(feature = "rustls-tls")]
     #[clap(long, env = "TLS_KEY")]
     tls_key: Option<PathBuf>,
+    /// Prefix to be stripped off when handling request.
+    #[clap(long, env = "WEBDAV_STRIP_PREFIX")]
+    strip_prefix: Option<String>,
     /// Enable debug log
     #[clap(long)]
     debug: bool,
+    /// Disable self auto upgrade
+    #[clap(long)]
+    no_self_upgrade: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -110,6 +113,15 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing_subscriber::fmt::init();
 
+    if env::var("NO_SELF_UPGRADE").is_err() && !opt.no_self_upgrade {
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = check_for_update(opt.debug) {
+                warn!("failed to check for update: {}", e);
+            }
+        })
+        .await?;
+    }
+
     let auth_user = opt.auth_user;
     let auth_password = opt.auth_password;
     if (auth_user.is_some() && auth_password.is_none())
@@ -125,7 +137,24 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("tls-cert and tls-key must be specified together."),
     };
 
-    let (drive_config, no_trash) = if let Some(domain_id) = opt.domain_id {
+    let workdir = opt
+        .workdir
+        .or_else(|| dirs::cache_dir().map(|c| c.join("aliyundrive-webdav")));
+    let refresh_token_from_file = if let Some(dir) = workdir.as_ref() {
+        read_refresh_token(dir).await.ok()
+    } else {
+        None
+    };
+    let (refresh_token, client_type) = if opt.domain_id.is_none()
+        && opt.refresh_token.is_none()
+        && refresh_token_from_file.is_none()
+        && atty::is(atty::Stream::Stdout)
+    {
+        (login().await?, ClientType::App)
+    } else {
+        parse_refresh_token(&opt.refresh_token.unwrap_or_default())?
+    };
+    let (drive_config, no_trash) = if let Some(domain_id) = opt.domain_id.as_ref() {
         (
             DriveConfig {
                 api_base_url: format!("https://{}.api.aliyunpds.com", domain_id),
@@ -133,8 +162,9 @@ async fn main() -> anyhow::Result<()> {
                     "https://{}.auth.aliyunpds.com/v2/account/token",
                     domain_id
                 ),
-                workdir: opt.workdir,
+                workdir,
                 app_id: Some("BasicUI".to_string()),
+                client_type: ClientType::Web,
             },
             true, // PDS doesn't have trash support
         )
@@ -142,14 +172,16 @@ async fn main() -> anyhow::Result<()> {
         (
             DriveConfig {
                 api_base_url: "https://api.aliyundrive.com".to_string(),
-                refresh_token_url: "https://websv.aliyundrive.com/token/refresh".to_string(),
-                workdir: opt.workdir,
+                refresh_token_url: String::new(),
+                workdir,
                 app_id: None,
+                client_type,
             },
             opt.no_trash,
         )
     };
-    let drive = AliyunDrive::new(drive_config, opt.refresh_token.unwrap_or_default()).await?;
+
+    let drive = AliyunDrive::new(drive_config, refresh_token).await?;
     let fs = AliyunDriveFileSystem::new(
         drive,
         opt.root,
@@ -161,12 +193,16 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     debug!("aliyundrive file system initialized");
 
-    let dav_server = DavHandler::builder()
+    let mut dav_server_builder = DavHandler::builder()
         .filesystem(Box::new(fs))
         .locksystem(MemLs::new())
         .read_buf_size(opt.read_buffer_size)
-        .autoindex(opt.auto_index)
-        .build_handler();
+        .autoindex(opt.auto_index);
+    if let Some(prefix) = opt.strip_prefix {
+        dav_server_builder = dav_server_builder.strip_prefix(prefix);
+    }
+
+    let dav_server = dav_server_builder.build_handler();
     debug!(
         read_buffer_size = opt.read_buffer_size,
         auto_index = opt.auto_index,
@@ -183,17 +219,18 @@ async fn main() -> anyhow::Result<()> {
     if use_tls {
         let tls_key = opt.tls_key.as_ref().unwrap();
         let tls_cert = opt.tls_cert.as_ref().unwrap();
-        let incoming =
-            TlsListener::new(tls_acceptor(tls_key, tls_cert)?, AddrIncoming::bind(&addr)?).filter(
-                |conn| {
-                    if let Err(err) = conn {
-                        error!("TLS error: {:?}", err);
-                        ready(false)
-                    } else {
-                        ready(true)
-                    }
-                },
-            );
+        let incoming = TlsListener::new(
+            SpawningHandshakes(tls_acceptor(tls_key, tls_cert)?),
+            AddrIncoming::bind(&addr)?,
+        )
+        .filter(|conn| {
+            if let Err(err) = conn {
+                error!("TLS error: {:?}", err);
+                ready(false)
+            } else {
+                ready(true)
+            }
+        });
         let server = hyper::Server::builder(accept::from_stream(incoming)).serve(MakeSvc {
             auth_user: auth_user.clone(),
             auth_password: auth_password.clone(),
@@ -330,4 +367,107 @@ fn private_keys(rd: &mut dyn io::BufRead) -> Result<Vec<Vec<u8>>, io::Error> {
             _ => {}
         };
     }
+}
+
+async fn login() -> anyhow::Result<String> {
+    use crate::login::model::{AuthorizationToken, Ok, QueryQrCodeCkForm};
+    use anyhow::Context;
+
+    let scan = login::QrCodeScanner::new().await?;
+    // 返回二维码内容结果集
+    let generator_qr_code_result = scan.generator().await?;
+    // 需要生成二维码的内容
+    let qrcode_content = generator_qr_code_result.get_content();
+    let ck_form = QueryQrCodeCkForm::from(generator_qr_code_result);
+    // 打印二维码
+    qr2term::print_qr(&qrcode_content)?;
+    info!("Please scan the qrcode to login in 30 seconds");
+    for _i in 0..10 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        // 模拟轮训查询二维码状态
+        let query_result = scan.query(&ck_form).await?;
+        if query_result.ok() {
+            // query_result.is_new() 表示未扫码状态
+            if query_result.is_new() {
+                // 做点什么..
+                continue;
+            }
+            // query_result.is_expired() 表示扫码成功，但未点击确认登陆
+            if query_result.is_expired() {
+                // 做点什么..
+                debug!("login expired");
+                continue;
+            }
+            // 移动端APP扫码成功并确认登陆
+            if query_result.is_confirmed() {
+                // 获取移动端登陆Result
+                let mobile_login_result = query_result
+                    .get_mobile_login_result()
+                    .context("failed to get mobile login result")?;
+                // 移动端 refresh token
+                let refresh_token = mobile_login_result
+                    .refresh_token()
+                    .context("failed to get refresh token")?;
+                return Ok(refresh_token);
+            }
+        }
+    }
+    anyhow::bail!("Login failed")
+}
+
+fn check_for_update(show_output: bool) -> anyhow::Result<()> {
+    use self_update::update::UpdateStatus;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let auth_token = env::var("GITHUB_TOKEN")
+        .unwrap_or_else(|_| env::var("HOMEBREW_GITHUB_API_TOKEN").unwrap_or_default());
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("messense")
+        .repo_name("aliyundrive-webdav")
+        .bin_name("aliyundrive-webdav")
+        .target(if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else {
+            self_update::get_target()
+        })
+        .auth_token(&auth_token)
+        .show_output(show_output)
+        .show_download_progress(true)
+        .no_confirm(true)
+        .current_version(cargo_crate_version!())
+        .build()?
+        .update_extended()?;
+    if let UpdateStatus::Updated(ref release) = status {
+        if let Some(body) = &release.body {
+            if !body.trim().is_empty() {
+                info!("aliyundrive-webdav upgraded to {}:\n", release.version);
+                info!("{}", body);
+            } else {
+                info!("aliyundrive-webdav upgraded to {}", release.version);
+            }
+        }
+    } else {
+        info!("aliyundrive-webdav is up-to-date");
+    }
+
+    if status.updated() {
+        warn!("Respawning...");
+        let current_exe = env::current_exe();
+        let mut command = Command::new(current_exe?);
+        command.args(env::args().skip(1)).env("NO_SELF_UPGRADE", "");
+        #[cfg(unix)]
+        {
+            let err = command.exec();
+            anyhow::bail!(err);
+        }
+
+        #[cfg(windows)]
+        {
+            let status = command.spawn().and_then(|mut c| c.wait())?;
+            anyhow::bail!("aliyundrive-webdav upgraded");
+        }
+    }
+    Ok(())
 }

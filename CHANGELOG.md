@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.8.0
+
+* 增加配置上传文件缓冲区大小参数 `--upload-buffer-size`
+* 增加配置跳过上传相同大小同名文件参数 `--skip-upload-same-size`, 注意启用该选项虽然能加速上传但可能会导致修改过的同样大小的文件不会被上传
+
+## 1.7.4
+
+* 删除文件时忽略 404 和 400 状态码
+* 修复梅林 arm384/arm386 使用 usb2jffs 插件后安装报错 `bad number` 问题
+* 上传文件出错时日志中增加更详细的错误信息
+
 ## 1.7.3
 
 * 调用云盘接口增加自动重试机制

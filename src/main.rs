@@ -60,6 +60,9 @@ struct Opt {
     /// Read/download buffer size in bytes, defaults to 10MB
     #[clap(short = 'S', long, default_value = "10485760")]
     read_buffer_size: usize,
+    /// Upload buffer size in bytes, defaults to 16MB
+    #[clap(long, default_value = "16777216")]
+    upload_buffer_size: usize,
     /// Directory entries cache size
     #[clap(long, default_value = "1000")]
     cache_size: u64,
@@ -98,6 +101,9 @@ struct Opt {
     /// Disable self auto upgrade
     #[clap(long)]
     no_self_upgrade: bool,
+    /// Skip uploading same size file
+    #[clap(long)]
+    skip_upload_same_size: bool,
 
     #[clap(subcommand)]
     subcommands: Option<Commands>,
@@ -254,8 +260,9 @@ async fn main() -> anyhow::Result<()> {
         opt.cache_ttl,
         no_trash,
         opt.read_only,
-    )
-    .await?;
+        opt.upload_buffer_size,
+        opt.skip_upload_same_size,
+    )?;
     debug!("aliyundrive file system initialized");
 
     let mut dav_server_builder = DavHandler::builder()

@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.10.1
+
+* 修复使用 Web 版 refresh token 时下载被错误 302 重定向的问题
+
+## 1.10.0
+
+* 使用 App refresh token 下载时默认 302 重定向而不需要中转
+
+## 1.9.0
+
+* 增加使用 HTTP 协议下载配置,低端设备中转时降低资源消耗
+
+## 1.8.9
+
+* 修复上传大文件时上传地址过期的问题
+
+## 1.8.8
+
+* 修复开启 TLS 后清除缓存导致进程 crash 的问题
+
+## 1.8.7
+
+* 复制/删除文件夹时清除原文件夹缓存内容
+
+## 1.8.6
+
+* 修复重命名文件夹时原文件夹缓存内容未清除的问题
+
+## 1.8.5
+
+* 支持 rclone 以 Nextcloud WebDAV 模式上传时跳过上传相同 sha1 哈希值文件
+
+## 1.8.4
+
+* 支持 rclone 以 OwnCloud/Nextcloud WebDAV 模式挂载时返回 sha1 checksum
+
+## 1.8.3
+
+* 优化上传文件完成目录缓存失效策略
+
+## 1.8.2
+
+* 修复读取目录在阿里云盘接口请求错误时返回 404 的问题
+* OpenWrt 界面增加清除缓存功能
+
+## 1.8.1
+
+* 增加调试模式 HTTP 请求日志输出
+
 ## 1.8.0
 
 * 增加配置上传文件缓冲区大小参数 `--upload-buffer-size`

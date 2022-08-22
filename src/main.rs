@@ -8,14 +8,17 @@ use std::{env, io};
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use dav_server::{body::Body, memls::MemLs, DavConfig, DavHandler};
+#[cfg(any(unix, feature = "rustls-tls"))]
+use futures_util::stream::StreamExt;
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 use hyper::{service::Service, Request, Response};
 use self_update::cargo_crate_version;
 use tracing::{debug, error, info, warn};
+#[cfg(unix)]
+use {signal_hook::consts::signal::*, signal_hook_tokio::Signals};
 
 #[cfg(feature = "rustls-tls")]
 use {
-    futures_util::stream::StreamExt,
     hyper::server::accept,
     hyper::server::conn::AddrIncoming,
     std::fs::File,
@@ -27,6 +30,7 @@ use {
     tokio_rustls::TlsAcceptor,
 };
 
+use cache::Cache;
 use drive::{parse_refresh_token, read_refresh_token, AliyunDrive, ClientType, DriveConfig};
 use vfs::AliyunDriveFileSystem;
 
@@ -57,6 +61,9 @@ struct Opt {
     /// Automatically generate index.html
     #[clap(short = 'I', long)]
     auto_index: bool,
+    /// Disable 302 redirect when using app refresh token
+    #[clap(long)]
+    no_redirect: bool,
     /// Read/download buffer size in bytes, defaults to 10MB
     #[clap(short = 'S', long, default_value = "10485760")]
     read_buffer_size: usize,
@@ -104,6 +111,9 @@ struct Opt {
     /// Skip uploading same size file
     #[clap(long)]
     skip_upload_same_size: bool,
+    /// Prefer downloading using HTTP protocol
+    #[clap(long)]
+    prefer_http_download: bool,
 
     #[clap(subcommand)]
     subcommands: Option<Commands>,
@@ -253,23 +263,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let drive = AliyunDrive::new(drive_config, refresh_token).await?;
-    let fs = AliyunDriveFileSystem::new(
-        drive,
-        opt.root,
-        opt.cache_size,
-        opt.cache_ttl,
-        no_trash,
-        opt.read_only,
-        opt.upload_buffer_size,
-        opt.skip_upload_same_size,
-    )?;
+    let mut fs = AliyunDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
+    fs.set_no_trash(no_trash)
+        .set_read_only(opt.read_only)
+        .set_upload_buffer_size(opt.upload_buffer_size)
+        .set_skip_upload_same_size(opt.skip_upload_same_size)
+        .set_prefer_http_download(opt.prefer_http_download);
     debug!("aliyundrive file system initialized");
+
+    #[cfg(unix)]
+    let dir_cache = fs.dir_cache.clone();
 
     let mut dav_server_builder = DavHandler::builder()
         .filesystem(Box::new(fs))
         .locksystem(MemLs::new())
         .read_buf_size(opt.read_buffer_size)
-        .autoindex(opt.auto_index);
+        .autoindex(opt.auto_index)
+        .redirect(!opt.no_redirect && matches!(client_type, ClientType::App));
     if let Some(prefix) = opt.strip_prefix {
         dav_server_builder = dav_server_builder.strip_prefix(prefix);
     }
@@ -309,7 +319,22 @@ async fn main() -> anyhow::Result<()> {
             handler: dav_server.clone(),
         });
         info!("listening on https://{}", addr);
+
+        #[cfg(not(unix))]
         let _ = server.await.map_err(|e| error!("server error: {}", e));
+
+        #[cfg(unix)]
+        {
+            let signals = Signals::new(&[SIGHUP])?;
+            let handle = signals.handle();
+            let signals_task = tokio::spawn(handle_signals(signals, dir_cache));
+
+            let _ = server.await.map_err(|e| error!("server error: {}", e));
+
+            // Terminate the signal stream.
+            handle.close();
+            signals_task.await?;
+        }
         return Ok(());
     }
     let server = hyper::Server::bind(&addr).serve(MakeSvc {
@@ -318,8 +343,36 @@ async fn main() -> anyhow::Result<()> {
         handler: dav_server,
     });
     info!("listening on http://{}", server.local_addr());
+
+    #[cfg(not(unix))]
     let _ = server.await.map_err(|e| error!("server error: {}", e));
+
+    #[cfg(unix)]
+    {
+        let signals = Signals::new(&[SIGHUP])?;
+        let handle = signals.handle();
+        let signals_task = tokio::spawn(handle_signals(signals, dir_cache));
+
+        let _ = server.await.map_err(|e| error!("server error: {}", e));
+
+        // Terminate the signal stream.
+        handle.close();
+        signals_task.await?;
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn handle_signals(mut signals: Signals, dir_cache: Cache) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGHUP => {
+                dir_cache.invalidate_all();
+                info!("directory cache invalidated by SIGHUP");
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone)]
